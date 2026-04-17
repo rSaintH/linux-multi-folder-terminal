@@ -1,0 +1,10 @@
+# Dependencias instalaveis via pip
+psutil>=5.9
+
+# Observacao:
+# Gtk/Gdk/Vte vem do sistema, nao do pip neste projeto.
+# Em Ubuntu/Debian, instale tambem:
+#   sudo apt install python3-gi gir1.2-vte-2.91 gir1.2-gtk-3.0
+#
+# Para gerar executavel com PyInstaller, opcionalmente use:
+#   pyinstaller>=6.0
