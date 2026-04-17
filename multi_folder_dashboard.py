@@ -16,8 +16,18 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
-from app_config import AppSettings, ShortcutSpec, load_settings, load_state, save_state
+from app_config import (
+    AppSettings,
+    AppState,
+    FolderLauncherSpec,
+    ShortcutSpec,
+    load_settings,
+    load_state,
+    save_settings,
+    save_state,
+)
 from gtk_compat import (
     Gdk,
     Gio,
@@ -36,13 +46,13 @@ from gtk_compat import (
     paned_set_start_child,
     present,
     set_child,
+    set_label_wrap,
     set_application_identity,
     set_window_icon_from_file,
     minimize_window,
     show_all_if_needed,
 )
 from system_utils import (
-    PortInfo,
     get_listening_ports,
     get_process_details,
     terminate_process_tree,
@@ -76,6 +86,14 @@ CSS = b"""
     font-size: 0.78em;
     opacity: 0.55;
 }
+.terminal-topbar {
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(130, 130, 130, 0.35);
+    background-color: rgba(48, 52, 60, 0.35);
+}
+.terminal-topbar-title {
+    font-weight: bold;
+}
 .shortcut-bar {
     border-top: 1px solid rgba(130, 130, 130, 0.45);
     background-color: rgba(48, 52, 60, 0.65);
@@ -103,6 +121,7 @@ PROGRAM_NAME = "multi-folder-dashboard"
 APPLICATION_NAME = "Multi Folder Dashboard"
 APPLICATION_ID = "io.github.rafael.MultiFolderDashboard"
 DESKTOP_FILE_NAME = f"{APPLICATION_ID}.desktop"
+DIRECTORY_CONTENT_TYPE = "inode/directory"
 
 
 def resolve_icon_path() -> str:
@@ -172,6 +191,344 @@ def show_message_dialog(
     present(dialog)
 
 
+def truncate_text(text: str, max_chars: int) -> str:
+    stripped = text.strip()
+    if len(stripped) <= max_chars:
+        return stripped
+    return stripped[: max_chars - 3].rstrip() + "..."
+
+
+def get_app_info_name(app_info: Gio.AppInfo) -> str:
+    try:
+        name = app_info.get_display_name()
+    except AttributeError:
+        name = ""
+    return name or app_info.get_name() or "Aplicativo"
+
+
+def build_folder_launcher_spec(app_info: Gio.AppInfo) -> FolderLauncherSpec:
+    return FolderLauncherSpec(
+        app_id=app_info.get_id() or "",
+        app_name=get_app_info_name(app_info),
+        app_exec=app_info.get_executable() or "",
+    )
+
+
+def list_directory_app_infos() -> list[Gio.AppInfo]:
+    apps = Gio.AppInfo.get_all_for_type(DIRECTORY_CONTENT_TYPE) or []
+    deduped: list[Gio.AppInfo] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for app_info in apps:
+        if hasattr(app_info, "should_show") and not app_info.should_show():
+            continue
+
+        key = (
+            app_info.get_id() or "",
+            app_info.get_executable() or "",
+            get_app_info_name(app_info),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(app_info)
+
+    deduped.sort(key=lambda item: get_app_info_name(item).lower())
+    return deduped
+
+
+class ShortcutEditorRow(Gtk.ListBoxRow):
+    def __init__(self, shortcut: ShortcutSpec, on_remove: Callable[["ShortcutEditorRow"], None]):
+        super().__init__()
+        if hasattr(self, "set_activatable"):
+            self.set_activatable(False)
+        if hasattr(self, "set_selectable"):
+            self.set_selectable(False)
+
+        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        container.set_margin_top(8)
+        container.set_margin_bottom(8)
+        container.set_margin_start(10)
+        container.set_margin_end(10)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        title = make_label("Atalho", ["section-title"], hexpand=True)
+        box_append(header, title)
+
+        remove_button = make_button("Remover", lambda _btn: on_remove(self), ["flat"])
+        remove_button.set_focus_on_click(False)
+        box_append(header, remove_button)
+        box_append(container, header)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(10)
+        grid.set_row_spacing(8)
+        grid.set_hexpand(True)
+
+        grid.attach(make_label("Label"), 0, 0, 1, 1)
+        self.label_entry = Gtk.Entry()
+        self.label_entry.set_hexpand(True)
+        self.label_entry.set_text(shortcut.label)
+        grid.attach(self.label_entry, 1, 0, 1, 1)
+
+        grid.attach(make_label("Comando"), 0, 1, 1, 1)
+        self.command_entry = Gtk.Entry()
+        self.command_entry.set_hexpand(True)
+        self.command_entry.set_text(shortcut.command)
+        grid.attach(self.command_entry, 1, 1, 1, 1)
+
+        self.submit_check = Gtk.CheckButton(label="Enviar Enter automaticamente")
+        self.submit_check.set_active(shortcut.submit)
+        grid.attach(self.submit_check, 0, 2, 2, 1)
+
+        cursor_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box_append(cursor_box, make_label("Mover cursor"))
+        adjustment = Gtk.Adjustment(
+            value=max(0, shortcut.cursor_left),
+            lower=0,
+            upper=120,
+            step_increment=1,
+            page_increment=5,
+            page_size=0,
+        )
+        self.cursor_spin = Gtk.SpinButton(adjustment=adjustment, digits=0)
+        self.cursor_spin.set_numeric(True)
+        self.cursor_spin.set_width_chars(3)
+        box_append(cursor_box, self.cursor_spin)
+        box_append(cursor_box, make_label("casas para a esquerda"))
+        grid.attach(cursor_box, 0, 3, 2, 1)
+
+        box_append(container, grid)
+        set_child(self, container)
+
+
+class ShortcutEditorDialog(Gtk.Dialog):
+    def __init__(
+        self,
+        parent: Gtk.Window,
+        settings: AppSettings,
+        on_save: Callable[[AppSettings], None],
+    ):
+        super().__init__(transient_for=parent, modal=True, title="Gerenciar atalhos")
+        self._settings = settings
+        self._on_save = on_save
+        self._rows: list[ShortcutEditorRow] = []
+
+        self.set_default_size(760, 460)
+
+        self.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        save_button = self.add_button("Salvar", Gtk.ResponseType.OK)
+        add_css_class(save_button, "suggested-action")
+
+        content = self.get_content_area()
+        content.set_spacing(10)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        intro = make_label(
+            "Edite os atalhos que aparecem abaixo do terminal. "
+            "Use 'Mover cursor' para comandos como git commit -m \"\".",
+            ["helper-label"],
+        )
+        set_label_wrap(intro, True)
+        box_append(content, intro)
+
+        self.error_label = make_label("", ["helper-label"])
+        set_label_wrap(self.error_label, True)
+        self.error_label.set_visible(False)
+        box_append(content, self.error_label)
+
+        add_button = make_button("Adicionar atalho", lambda _btn: self._add_row(), ["flat"])
+        add_button.set_focus_on_click(False)
+        box_append(content, add_button)
+
+        self.shortcut_list = Gtk.ListBox()
+        self.shortcut_list.set_selection_mode(Gtk.SelectionMode.NONE)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_hexpand(True)
+        scrolled.set_vexpand(True)
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        set_child(scrolled, self.shortcut_list)
+        box_append(content, scrolled)
+
+        for shortcut in settings.shortcuts:
+            self._add_row(shortcut)
+
+        self.connect("response", self._on_response)
+
+    def _add_row(self, shortcut: ShortcutSpec | None = None) -> None:
+        row = ShortcutEditorRow(
+            shortcut or ShortcutSpec("", "", submit=True, cursor_left=0),
+            self._remove_row,
+        )
+        self._rows.append(row)
+        listbox_append(self.shortcut_list, row)
+        self._set_error("")
+        show_all_if_needed(row)
+        show_all_if_needed(self.shortcut_list)
+
+    def _remove_row(self, row: ShortcutEditorRow) -> None:
+        if row in self._rows:
+            self._rows.remove(row)
+        self.shortcut_list.remove(row)
+        self._set_error("")
+
+    def _set_error(self, message: str) -> None:
+        self.error_label.set_text(message)
+        self.error_label.set_visible(bool(message))
+
+    def _collect_shortcuts(self) -> list[ShortcutSpec] | None:
+        shortcuts: list[ShortcutSpec] = []
+        for index, row in enumerate(self._rows, start=1):
+            label = row.label_entry.get_text().strip()
+            command = row.command_entry.get_text().strip()
+            if not label or not command:
+                self._set_error(
+                    f"Preencha label e comando em todos os atalhos antes de salvar. Linha {index}."
+                )
+                return None
+
+            shortcuts.append(
+                ShortcutSpec(
+                    label=label,
+                    command=command,
+                    submit=row.submit_check.get_active(),
+                    cursor_left=max(0, row.cursor_spin.get_value_as_int()),
+                )
+            )
+
+        self._set_error("")
+        return shortcuts
+
+    def _on_response(self, dialog, response) -> None:
+        if response != Gtk.ResponseType.OK:
+            dialog.destroy()
+            return
+
+        shortcuts = self._collect_shortcuts()
+        if shortcuts is None:
+            return
+
+        updated_settings = AppSettings(
+            window_width=self._settings.window_width,
+            window_height=self._settings.window_height,
+            terminal_font=self._settings.terminal_font,
+            terminal_fg=self._settings.terminal_fg,
+            terminal_bg=self._settings.terminal_bg,
+            refresh_seconds=self._settings.refresh_seconds,
+            shortcuts=shortcuts,
+        )
+        self._on_save(updated_settings)
+        dialog.destroy()
+
+
+class DirectoryAppChooserDialog(Gtk.Dialog):
+    def __init__(
+        self,
+        parent: Gtk.Window,
+        folder_path: Path,
+        on_open: Callable[[Gio.AppInfo], None],
+    ):
+        super().__init__(
+            transient_for=parent,
+            modal=True,
+            title=f"Open With - {folder_path.name}",
+        )
+        self._on_open = on_open
+        self._apps = list_directory_app_infos()
+
+        self.set_default_size(560, 420)
+
+        self.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        self._open_button = self.add_button("Abrir", Gtk.ResponseType.OK)
+        add_css_class(self._open_button, "suggested-action")
+
+        content = self.get_content_area()
+        content.set_spacing(10)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        intro = make_label(
+            f"Escolha um aplicativo para abrir a pasta {folder_path}.",
+            ["helper-label"],
+        )
+        set_label_wrap(intro, True)
+        box_append(content, intro)
+
+        self.error_label = make_label("", ["helper-label"])
+        set_label_wrap(self.error_label, True)
+        self.error_label.set_visible(False)
+        box_append(content, self.error_label)
+
+        self.app_list = Gtk.ListBox()
+        self.app_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.app_list.connect("row-selected", self._on_row_selected)
+        self.app_list.connect("row-activated", lambda *_args: self.response(Gtk.ResponseType.OK))
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_hexpand(True)
+        scrolled.set_vexpand(True)
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        set_child(scrolled, self.app_list)
+        box_append(content, scrolled)
+
+        for app_info in self._apps:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_margin_top(8)
+            box.set_margin_bottom(8)
+            box.set_margin_start(10)
+            box.set_margin_end(10)
+            box_append(box, make_label(get_app_info_name(app_info), ["section-title"]))
+
+            executable = app_info.get_executable() or app_info.get_commandline() or ""
+            if executable:
+                exec_label = make_label(executable, ["helper-label"])
+                set_label_wrap(exec_label, True)
+                box_append(box, exec_label)
+
+            set_child(row, box)
+            row.app_info = app_info
+            listbox_append(self.app_list, row)
+
+        if not self._apps:
+            self._set_error("Nenhum aplicativo compativel com pastas foi encontrado.")
+            self._open_button.set_sensitive(False)
+        else:
+            first_row = self.app_list.get_row_at_index(0)
+            if first_row is not None:
+                self.app_list.select_row(first_row)
+
+        self.connect("response", self._on_response)
+
+    def _set_error(self, message: str) -> None:
+        self.error_label.set_text(message)
+        self.error_label.set_visible(bool(message))
+
+    def _on_row_selected(self, _listbox, row) -> None:
+        self._open_button.set_sensitive(row is not None)
+        if row is not None:
+            self._set_error("")
+
+    def _on_response(self, dialog, response) -> None:
+        if response != Gtk.ResponseType.OK:
+            dialog.destroy()
+            return
+
+        row = self.app_list.get_selected_row()
+        if row is None:
+            self._set_error("Selecione um aplicativo antes de continuar.")
+            return
+
+        self._on_open(row.app_info)
+        dialog.destroy()
+
+
 class FolderTerminalPanel(Gtk.Box):
     def __init__(self, folder_path: Path, settings: AppSettings):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
@@ -192,7 +549,8 @@ class FolderTerminalPanel(Gtk.Box):
         self.vte.set_cursor_blink_mode(Vte.CursorBlinkMode.ON)
 
         box_append(self, make_scrolled_window(self.vte))
-        box_append(self, self._build_shortcut_bar())
+        self.shortcut_bar = self._build_shortcut_bar()
+        box_append(self, self.shortcut_bar)
 
         self._spawn_shell()
 
@@ -209,6 +567,14 @@ class FolderTerminalPanel(Gtk.Box):
             box_append(bar, button)
 
         return bar
+
+    def refresh_shortcut_bar(self, settings: AppSettings) -> None:
+        self.settings = settings
+        self.remove(self.shortcut_bar)
+        self.shortcut_bar = self._build_shortcut_bar()
+        box_append(self, self.shortcut_bar)
+        show_all_if_needed(self.shortcut_bar)
+        show_all_if_needed(self)
 
     def _run_shortcut(self, shortcut: ShortcutSpec) -> None:
         self.vte.grab_focus()
@@ -469,9 +835,14 @@ class MainWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application, settings: AppSettings):
         super().__init__(application=app)
         self.settings = settings
+        self._restored_state = load_state()
         self._panels: dict[str, FolderTerminalPanel] = {}
+        self._folder_launchers: dict[str, FolderLauncherSpec] = dict(
+            self._restored_state.folder_launchers
+        )
         self._sidebar_rows: dict[str, Gtk.ListBoxRow] = {}
         self._row_keys: dict[int, str] = {}
+        self._current_folder_key: str | None = None
         self._allow_close = False
 
         self.set_title("Gerenciador de Terminais")
@@ -566,6 +937,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         set_child(self, self.main_stack)
         self._update_terminal_workspace()
+        self._refresh_terminal_toolbar()
 
     def _build_terminals_workspace(self):
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -573,6 +945,13 @@ class MainWindow(Gtk.ApplicationWindow):
 
         sidebar = self._build_sidebar()
         paned_set_start_child(paned, sidebar)
+
+        terminal_area = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        terminal_area.set_hexpand(True)
+        terminal_area.set_vexpand(True)
+
+        self.terminal_toolbar = self._build_terminal_toolbar()
+        box_append(terminal_area, self.terminal_toolbar)
 
         self.terminal_stack = Gtk.Stack()
         self.terminal_stack.set_hexpand(True)
@@ -603,8 +982,49 @@ class MainWindow(Gtk.ApplicationWindow):
         self.terminal_stack.add_named(self.notebook, "notebook")
         self.terminal_stack.set_visible_child_name("empty")
 
-        paned_set_end_child(paned, self.terminal_stack)
+        box_append(terminal_area, self.terminal_stack)
+        paned_set_end_child(paned, terminal_area)
         return paned
+
+    def _build_terminal_toolbar(self) -> Gtk.Box:
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        add_css_class(toolbar, "terminal-topbar")
+
+        self.current_folder_label = make_label(
+            "Nenhuma pasta selecionada",
+            ["terminal-topbar-title"],
+            hexpand=True,
+        )
+        self.current_folder_label.set_max_width_chars(40)
+        self.current_folder_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        box_append(toolbar, self.current_folder_label)
+
+        self.current_open_with_button = make_button(
+            "Open With",
+            lambda _btn: self._open_with_current_folder(),
+            ["flat"],
+        )
+        self.current_open_with_button.set_focus_on_click(False)
+        box_append(toolbar, self.current_open_with_button)
+
+        self.current_quick_open_button = make_button(
+            "",
+            lambda _btn: self._open_current_folder_with_saved_launcher(),
+            ["flat"],
+        )
+        self.current_quick_open_button.set_focus_on_click(False)
+        self.current_quick_open_button.set_visible(False)
+        box_append(toolbar, self.current_quick_open_button)
+
+        self.manage_shortcuts_button = make_button(
+            "Gerenciar atalhos",
+            lambda _btn: self._open_shortcut_manager(),
+            ["flat"],
+        )
+        self.manage_shortcuts_button.set_focus_on_click(False)
+        box_append(toolbar, self.manage_shortcuts_button)
+
+        return toolbar
 
     def _build_sidebar(self) -> Gtk.Box:
         sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -616,6 +1036,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.folder_listbox = Gtk.ListBox()
         self.folder_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        if hasattr(self.folder_listbox, "set_activate_on_single_click"):
+            self.folder_listbox.set_activate_on_single_click(True)
         self.folder_listbox.connect("row-activated", self._on_sidebar_activated)
 
         scrolled = Gtk.ScrolledWindow()
@@ -625,6 +1047,198 @@ class MainWindow(Gtk.ApplicationWindow):
 
         box_append(sidebar, scrolled)
         return sidebar
+
+    def _open_shortcut_manager(self) -> None:
+        try:
+            dialog = ShortcutEditorDialog(self, self.settings, self._apply_shortcut_settings)
+            show_all_if_needed(dialog)
+            present(dialog)
+        except Exception as exc:  # pragma: no cover - erro de runtime da GUI
+            show_message_dialog(
+                self,
+                "Nao foi possivel abrir o gerenciador de atalhos",
+                "O dialogo de atalhos falhou ao abrir.",
+                details=str(exc),
+                message_type=Gtk.MessageType.ERROR,
+            )
+
+    def _apply_shortcut_settings(self, settings: AppSettings) -> None:
+        self.settings = settings
+        save_settings(settings)
+
+        app = self.get_application()
+        if isinstance(app, App):
+            app.settings = settings
+
+        for panel in self._panels.values():
+            panel.refresh_shortcut_bar(settings)
+
+    def _get_current_panel(self) -> FolderTerminalPanel | None:
+        if not self._current_folder_key:
+            return None
+        panel = self._panels.get(self._current_folder_key)
+        if isinstance(panel, FolderTerminalPanel):
+            return panel
+        return None
+
+    def _get_current_folder_key(self) -> str | None:
+        panel = self._get_current_panel()
+        if panel is None:
+            return None
+        return str(panel.folder_path)
+
+    def _set_current_folder_key(self, folder_key: str | None) -> None:
+        if folder_key is not None and folder_key not in self._panels:
+            folder_key = None
+        self._current_folder_key = folder_key
+
+    def _build_app_state(self) -> AppState:
+        open_folders = list(self._panels.keys())
+        folder_launchers = {
+            folder_key: spec
+            for folder_key, spec in self._folder_launchers.items()
+            if folder_key in self._panels
+        }
+        return AppState(
+            open_folders=open_folders,
+            folder_launchers=folder_launchers,
+        )
+
+    def _save_app_state(self) -> None:
+        save_state(self._build_app_state())
+
+    def _resolve_saved_launcher_app(self, launcher: FolderLauncherSpec) -> Gio.AppInfo | None:
+        apps = list_directory_app_infos()
+
+        if launcher.app_id:
+            for app_info in apps:
+                if (app_info.get_id() or "") == launcher.app_id:
+                    return app_info
+
+        if launcher.app_exec:
+            for app_info in apps:
+                if (app_info.get_executable() or "") == launcher.app_exec:
+                    return app_info
+
+        return None
+
+    def _launch_folder_with_app(
+        self,
+        folder_key: str,
+        app_info: Gio.AppInfo,
+    ) -> tuple[bool, str]:
+        folder_path = Path(folder_key)
+        if not folder_path.exists() or not folder_path.is_dir():
+            return False, f"{folder_path} nao e mais uma pasta valida."
+
+        folder_file = Gio.File.new_for_path(str(folder_path))
+        try:
+            app_info.launch([folder_file], None)
+            return True, ""
+        except GLib.Error as exc:
+            return False, str(exc)
+        except Exception as exc:  # pragma: no cover - erro de runtime do SO
+            return False, str(exc)
+
+    def _sync_sidebar_selection_to_notebook(self) -> None:
+        current_page = self.notebook.get_current_page()
+        if current_page < 0:
+            self.folder_listbox.select_row(None)
+            return
+
+        panel = self.notebook.get_nth_page(current_page)
+        if isinstance(panel, FolderTerminalPanel):
+            self._select_sidebar_for_panel(panel)
+            return
+
+        self.folder_listbox.select_row(None)
+
+    def _open_with_dialog(self, folder_key: str) -> None:
+        if folder_key not in self._panels:
+            return
+
+        try:
+            dialog = DirectoryAppChooserDialog(
+                self,
+                Path(folder_key),
+                lambda app_info, current_key=folder_key: self._apply_folder_launcher(current_key, app_info),
+            )
+            show_all_if_needed(dialog)
+            present(dialog)
+        except Exception as exc:  # pragma: no cover - erro de runtime da GUI
+            show_message_dialog(
+                self,
+                "Nao foi possivel abrir o seletor de aplicativo",
+                "O dialogo de Open With falhou ao abrir.",
+                details=str(exc),
+                message_type=Gtk.MessageType.ERROR,
+            )
+
+    def _open_with_current_folder(self) -> None:
+        folder_key = self._get_current_folder_key()
+        if folder_key is None:
+            return
+        self._open_with_dialog(folder_key)
+
+    def _apply_folder_launcher(self, folder_key: str, app_info: Gio.AppInfo) -> None:
+        if folder_key not in self._panels:
+            return
+
+        success, details = self._launch_folder_with_app(folder_key, app_info)
+        if not success:
+            show_message_dialog(
+                self,
+                "Nao foi possivel abrir a pasta",
+                f"A pasta {folder_key} nao conseguiu abrir com {get_app_info_name(app_info)}.",
+                details=details,
+                message_type=Gtk.MessageType.ERROR,
+            )
+            return
+
+        self._folder_launchers[folder_key] = build_folder_launcher_spec(app_info)
+        self._save_app_state()
+        self._refresh_terminal_toolbar()
+
+    def _open_folder_with_saved_launcher(self, folder_key: str) -> None:
+        launcher = self._folder_launchers.get(folder_key)
+        if launcher is None:
+            self._refresh_terminal_toolbar()
+            return
+
+        app_info = self._resolve_saved_launcher_app(launcher)
+        if app_info is None:
+            self._refresh_terminal_toolbar()
+            show_message_dialog(
+                self,
+                "Aplicativo indisponivel",
+                "O aplicativo salvo para essa pasta nao esta mais disponivel.",
+                details=launcher.app_name or launcher.app_exec or launcher.app_id,
+                message_type=Gtk.MessageType.WARNING,
+            )
+            return
+
+        success, details = self._launch_folder_with_app(folder_key, app_info)
+        if not success:
+            show_message_dialog(
+                self,
+                "Nao foi possivel abrir a pasta",
+                f"A pasta {folder_key} nao conseguiu abrir com {get_app_info_name(app_info)}.",
+                details=details,
+                message_type=Gtk.MessageType.ERROR,
+            )
+            return
+
+        updated_launcher = build_folder_launcher_spec(app_info)
+        if updated_launcher != launcher:
+            self._folder_launchers[folder_key] = updated_launcher
+            self._save_app_state()
+        self._refresh_terminal_toolbar()
+
+    def _open_current_folder_with_saved_launcher(self) -> None:
+        folder_key = self._get_current_folder_key()
+        if folder_key is None:
+            return
+        self._open_folder_with_saved_launcher(folder_key)
 
     def _on_add_folder(self, _btn) -> None:
         if USING_GTK4:
@@ -684,7 +1298,9 @@ class MainWindow(Gtk.ApplicationWindow):
             page = self.notebook.page_num(existing_panel)
             if page >= 0:
                 self.notebook.set_current_page(page)
+                self._set_current_folder_key(key)
             self.main_stack.set_visible_child_name("terminals")
+            self._refresh_terminal_toolbar()
             return
 
         panel = FolderTerminalPanel(folder_path, self.settings)
@@ -705,15 +1321,17 @@ class MainWindow(Gtk.ApplicationWindow):
 
         page = self.notebook.append_page(panel, tab_box)
         self.notebook.set_current_page(page)
+        self._set_current_folder_key(key)
 
         row = self._make_sidebar_row(folder_path, key)
         self._sidebar_rows[key] = row
         self._row_keys[id(row)] = key
         listbox_append(self.folder_listbox, row)
 
-        self._save_open_folders()
+        self._save_app_state()
         self._refresh_sidebar_labels()
         self._update_terminal_workspace()
+        self._refresh_terminal_toolbar()
         self.main_stack.set_visible_child_name("terminals")
         self._select_sidebar_for_key(key)
         show_all_if_needed(panel)
@@ -779,13 +1397,25 @@ class MainWindow(Gtk.ApplicationWindow):
             self._row_keys.pop(id(row), None)
             self.folder_listbox.remove(row)
 
-        self._save_open_folders()
+        if self._current_folder_key == folder_key:
+            current_page = self.notebook.get_current_page()
+            current_panel = self.notebook.get_nth_page(current_page) if current_page >= 0 else None
+            if isinstance(current_panel, FolderTerminalPanel):
+                self._set_current_folder_key(str(current_panel.folder_path))
+            else:
+                self._set_current_folder_key(None)
+
+        self._folder_launchers.pop(folder_key, None)
+        self._save_app_state()
         self._refresh_sidebar_labels()
         self._update_terminal_workspace()
+        self._refresh_terminal_toolbar()
+        self._sync_sidebar_selection_to_notebook()
 
     def _update_terminal_workspace(self) -> None:
         has_folders = bool(self._panels)
         self.terminal_stack.set_visible_child_name("notebook" if has_folders else "empty")
+        self._refresh_terminal_toolbar()
 
     def _cycle_terminal_tab(self, direction: int) -> None:
         page_count = self.notebook.get_n_pages()
@@ -810,12 +1440,18 @@ class MainWindow(Gtk.ApplicationWindow):
 
         panel = self.notebook.get_nth_page(page_index)
         if isinstance(panel, FolderTerminalPanel):
+            self._set_current_folder_key(str(panel.folder_path))
             panel.vte.grab_focus()
             self._select_sidebar_for_panel(panel)
+            self._refresh_terminal_toolbar()
 
     def _on_notebook_switch_page(self, _notebook, page, page_index) -> None:
         if isinstance(page, FolderTerminalPanel):
+            self._set_current_folder_key(str(page.folder_path))
             self._select_sidebar_for_panel(page)
+        else:
+            self._set_current_folder_key(None)
+        self._refresh_terminal_toolbar()
 
     def _select_sidebar_for_panel(self, panel: FolderTerminalPanel) -> None:
         for folder_key, known_panel in self._panels.items():
@@ -847,19 +1483,53 @@ class MainWindow(Gtk.ApplicationWindow):
             else:
                 row.shortcut_label.set_text("[ ]")
 
-    def _save_open_folders(self) -> None:
-        save_state(self._panels.keys())
+    def _refresh_terminal_toolbar(self) -> None:
+        panel = self._get_current_panel()
+        if panel is None:
+            self.current_folder_label.set_text("Nenhuma pasta selecionada")
+            self.current_folder_label.set_tooltip_text(None)
+            self.current_open_with_button.set_sensitive(False)
+            self.current_quick_open_button.set_visible(False)
+            self.manage_shortcuts_button.set_sensitive(True)
+            return
+
+        folder_key = str(panel.folder_path)
+        folder_path = panel.folder_path
+        self.current_folder_label.set_text(folder_path.name)
+        self.current_folder_label.set_tooltip_text(str(folder_path))
+        self.current_open_with_button.set_sensitive(True)
+        self.manage_shortcuts_button.set_sensitive(True)
+
+        launcher = self._folder_launchers.get(folder_key)
+        if launcher is None:
+            self.current_quick_open_button.set_visible(False)
+            return
+
+        app_info = self._resolve_saved_launcher_app(launcher)
+        if app_info is None:
+            self.current_quick_open_button.set_visible(False)
+            self.current_quick_open_button.set_sensitive(False)
+            return
+
+        app_name = get_app_info_name(app_info)
+        self.current_quick_open_button.set_label(f"Abrir com {truncate_text(app_name, 20)}")
+        self.current_quick_open_button.set_tooltip_text(f"Abrir com {app_name}")
+        self.current_quick_open_button.set_sensitive(True)
+        self.current_quick_open_button.set_visible(True)
 
     def _restore_open_folders(self) -> None:
-        state = load_state()
         missing_paths: list[str] = []
 
-        for folder in state.open_folders:
+        for folder in self._restored_state.open_folders:
             path = Path(folder)
             if path.exists() and path.is_dir():
                 self._add_folder(path.resolve())
             else:
                 missing_paths.append(folder)
+                self._folder_launchers.pop(folder, None)
+
+        if missing_paths:
+            self._save_app_state()
 
         if missing_paths:
             GLib.idle_add(

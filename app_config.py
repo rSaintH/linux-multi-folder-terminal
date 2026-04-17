@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
-from typing import Iterable
 
 
 APP_DIR = Path.home() / ".config" / "multi-folder-dashboard"
@@ -21,6 +20,13 @@ class ShortcutSpec:
 
 
 @dataclass(frozen=True)
+class FolderLauncherSpec:
+    app_id: str = ""
+    app_name: str = ""
+    app_exec: str = ""
+
+
+@dataclass(frozen=True)
 class AppSettings:
     window_width: int = 1300
     window_height: int = 820
@@ -34,6 +40,7 @@ class AppSettings:
 @dataclass(frozen=True)
 class AppState:
     open_folders: list[str] = field(default_factory=list)
+    folder_launchers: dict[str, FolderLauncherSpec] = field(default_factory=dict)
 
 
 DEFAULT_SHORTCUTS = [
@@ -64,19 +71,25 @@ def _default_settings() -> AppSettings:
     return AppSettings(shortcuts=list(DEFAULT_SHORTCUTS))
 
 
+def save_settings(settings: AppSettings) -> None:
+    ensure_app_dir()
+    SETTINGS_FILE.write_text(
+        json.dumps(_serialize_settings(settings), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def load_settings() -> AppSettings:
     ensure_app_dir()
     defaults = _default_settings()
 
     if not SETTINGS_FILE.exists():
-        SETTINGS_FILE.write_text(
-            json.dumps(_serialize_settings(defaults), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        save_settings(defaults)
         return defaults
 
     try:
         raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        raw_shortcuts = raw.get("shortcuts")
         shortcuts = [
             ShortcutSpec(
                 label=item["label"],
@@ -84,11 +97,11 @@ def load_settings() -> AppSettings:
                 submit=bool(item.get("submit", True)),
                 cursor_left=int(item.get("cursor_left", 0)),
             )
-            for item in raw.get("shortcuts", [])
+            for item in raw_shortcuts or []
             if item.get("label") and item.get("command")
         ]
 
-        if not shortcuts:
+        if raw_shortcuts is None:
             shortcuts = list(DEFAULT_SHORTCUTS)
 
         return AppSettings(
@@ -112,14 +125,32 @@ def load_state() -> AppState:
     try:
         raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         folders = [str(item) for item in raw.get("open_folders", []) if item]
-        return AppState(open_folders=folders)
+        folder_launchers = {
+            str(folder_path): FolderLauncherSpec(
+                app_id=str(spec.get("app_id", "")),
+                app_name=str(spec.get("app_name", "")),
+                app_exec=str(spec.get("app_exec", "")),
+            )
+            for folder_path, spec in raw.get("folder_launchers", {}).items()
+            if folder_path and isinstance(spec, dict)
+        }
+        return AppState(
+            open_folders=folders,
+            folder_launchers=folder_launchers,
+        )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return AppState()
 
 
-def save_state(folder_paths: Iterable[str]) -> None:
+def save_state(state: AppState) -> None:
     ensure_app_dir()
-    data = {"open_folders": list(folder_paths)}
+    data = {
+        "open_folders": list(state.open_folders),
+        "folder_launchers": {
+            folder_path: asdict(spec)
+            for folder_path, spec in state.folder_launchers.items()
+        },
+    }
     STATE_FILE.write_text(
         json.dumps(data, indent=2, ensure_ascii=False),
         encoding="utf-8",

@@ -104,6 +104,14 @@ def present(widget) -> None:
         widget.show()
 
 
+def set_label_wrap(label, enabled: bool = True) -> None:
+    if hasattr(label, "set_wrap"):
+        label.set_wrap(enabled)
+        return
+    if hasattr(label, "set_line_wrap"):
+        label.set_line_wrap(enabled)
+
+
 def show_all_if_needed(widget) -> None:
     if not USING_GTK4 and hasattr(widget, "show_all"):
         widget.show_all()
