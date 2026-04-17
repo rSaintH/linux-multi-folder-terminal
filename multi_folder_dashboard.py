@@ -110,6 +110,8 @@ def resolve_icon_path() -> str:
     candidate_paths = [
         Path(bundled_base) / "icon.png" if bundled_base else None,
         Path(__file__).resolve().parent / "icon.png",
+        Path("/usr/share/icons/hicolor/1024x1024/apps/io.github.rafael.MultiFolderDashboard.png"),
+        Path("/usr/share/pixmaps/io.github.rafael.MultiFolderDashboard.png"),
         Path("/home/rafael/Downloads/icon.png"),
     ]
     for candidate in candidate_paths:

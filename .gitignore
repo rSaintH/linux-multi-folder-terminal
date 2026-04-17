@@ -13,6 +13,8 @@ venv/
 build/
 dist/
 *.spec
+packaging/deb/output/
+packaging/deb/multi-folder-dashboard_*/
 
 # Tool caches
 .pytest_cache/
